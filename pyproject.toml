@@ -8,9 +8,11 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.141.1",
     "huggingface-hub>=1.30.0",
     "langgraph>=1.2.11",
     "streamlit>=1.63.0",
+    "uvicorn>=0.52.4",
 ]
 
 [project.scripts]
