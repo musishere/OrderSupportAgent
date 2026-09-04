@@ -1,0 +1,134 @@
+import json
+import operator
+from typing import Annotated, TypedDict
+
+from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import END, START, StateGraph
+
+from src.order_support_agent import TOOL_REGISTRY, TOOLS_SCHEMA, get_client
+from src.order_support_agent.agent import SYSTEM_PROMPT
+
+
+class AgentState(TypedDict):
+    messages: Annotated[list, operator.add]
+    iteration_count: int
+
+
+def call_model(state: AgentState, config: RunnableConfig) -> dict:
+    client = config.get("configurable", {}).get("client") or get_client()
+    response = client.chat_completion(messages=state["messages"], tools=TOOLS_SCHEMA, tool_choice="auto")
+    message = response.choices[0].message
+
+    new_message = {"role": "assistant", "content": message.content}
+    if message.tool_calls:
+        new_message["tool_calls"] = [
+            {"id": tc.id, "type": "function",
+             "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+            for tc in message.tool_calls
+        ]
+
+    return {"messages": [new_message], "iteration_count": state["iteration_count"] + 1}
+
+
+def call_tool(state: AgentState) -> dict:
+    last = state["messages"][-1]
+    tool_messages = []
+    for tc in last.get("tool_calls", []):
+        name = tc["function"]["name"]
+        try:
+            args = json.loads(tc["function"]["arguments"] or "{}")
+        except json.JSONDecodeError:
+            args = {}
+
+        fn = TOOL_REGISTRY.get(name)
+        if fn is None:
+            result = {"success": False, "error": f"unknown_tool:{name}"}
+        else:
+            try:
+                result = fn(**args)
+            except TypeError as e:
+                result = {"success": False, "error": f"bad_arguments:{e}"}
+
+        tool_messages.append({
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "name": name,
+            "content": json.dumps(result, default=str),
+        })
+
+    return {"messages": tool_messages}
+
+
+def route_after_model(state: AgentState) -> str:
+    return "call_tool" if state["messages"][-1].get("tool_calls") else END
+
+
+def build_graph():
+    graph = StateGraph(AgentState)
+    graph.add_node("call_model", call_model)
+    graph.add_node("call_tool", call_tool)
+    graph.add_edge(START, "call_model")
+    graph.add_conditional_edges("call_model", route_after_model, {"call_tool": "call_tool", END: END})
+    graph.add_edge("call_tool", "call_model")
+    return graph.compile()
+
+
+def run_graph(user_message: str, max_steps: int = 8, client=None) -> dict:
+    app = build_graph()
+    initial_state = {
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        "iteration_count": 0,
+    }
+    try:
+        final_state = app.invoke(
+            initial_state,
+            config={"configurable": {"client": client}, "recursion_limit": max_steps * 2 + 2},
+        )
+    except GraphRecursionError:
+        return {"response": None, "messages": initial_state["messages"], "error": "max_steps_exceeded"}
+
+    return {"response": final_state["messages"][-1]["content"], "messages": final_state["messages"]}
+
+
+if __name__ == "__main__":
+    from types import SimpleNamespace
+
+    from src.db.connect_db import get_connection
+
+    conn = get_connection()
+    order_id = conn.execute("SELECT order_id FROM orders LIMIT 1").fetchone()[0]
+    conn.close()
+
+    def tool_call(call_id, name, arguments):
+        return SimpleNamespace(id=call_id, function=SimpleNamespace(name=name, arguments=json.dumps(arguments)))
+
+    def chat_response(content=None, tool_calls=None):
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=tool_calls))])
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_completion(self, messages, tools, tool_choice):
+            self.calls += 1
+            if self.calls == 1:
+                return chat_response(tool_calls=[tool_call("call_1", "get_order", {"order_id": order_id})])
+            return chat_response(content=f"Your order {order_id} was found.")
+
+    result = run_graph(f"What's the status of order {order_id}?", client=FakeClient())
+    assert result["response"] == f"Your order {order_id} was found."
+    tool_msgs = [m for m in result["messages"] if m["role"] == "tool"]
+    assert tool_msgs and json.loads(tool_msgs[0]["content"])["order_id"] == order_id
+
+    class LoopingClient:
+        def chat_completion(self, messages, tools, tool_choice):
+            return chat_response(tool_calls=[tool_call("call_1", "search_knowledge_base", {"query": "x"})])
+
+    capped_result = run_graph("hi", max_steps=2, client=LoopingClient())
+    assert capped_result["error"] == "max_steps_exceeded"
+
+    print("OK: langgraph self-checks passed")
