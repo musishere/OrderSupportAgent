@@ -10,11 +10,15 @@ from src.tools.tools import (
     update_shipping_address,
 )
 
-HF_MODEL = os.environ.get("HF_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
+MISTRAL_MODEL = os.environ.get("MISTRAL_MODEL", "ministral-8b-latest")
+MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
 
 
 def get_client() -> InferenceClient:
-    return InferenceClient(model=HF_MODEL, token=os.environ.get("HF_TOKEN"))
+    return InferenceClient(
+        base_url=MISTRAL_BASE_URL,
+        api_key=os.environ.get("MISTRAL_API_KEY"),
+    )
 
 
 # OpenAI-style function schemas — harness-controlled fields (confirmed, approved_by)
@@ -99,7 +103,7 @@ TOOL_REGISTRY = {
 
 
 def main() -> None:
-    print(f"HF client ready for model={HF_MODEL}, {len(TOOLS_SCHEMA)} tools registered")
+    print(f"Mistral client ready for model={MISTRAL_MODEL}, {len(TOOLS_SCHEMA)} tools registered")
 
 
 if __name__ == "__main__":

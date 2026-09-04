@@ -1,6 +1,6 @@
 import json
 
-from src.order_support_agent import TOOL_REGISTRY, TOOLS_SCHEMA, get_client
+from src.order_support_agent import MISTRAL_MODEL, TOOL_REGISTRY, TOOLS_SCHEMA, get_client
 
 SYSTEM_PROMPT = (
     "You are an order support agent. Use the available tools to look up orders, "
@@ -18,7 +18,7 @@ def run_agent(user_message: str, max_steps: int = 8, client=None) -> dict:
     trace = []
 
     for step in range(max_steps):
-        response = client.chat_completion(messages=messages, tools=TOOLS_SCHEMA, tool_choice="auto")
+        response = client.chat_completion(model=MISTRAL_MODEL, messages=messages, tools=TOOLS_SCHEMA, tool_choice="auto")
         message = response.choices[0].message
 
         if not message.tool_calls:
@@ -81,7 +81,7 @@ if __name__ == "__main__":
         def __init__(self):
             self.calls = 0
 
-        def chat_completion(self, messages, tools, tool_choice):
+        def chat_completion(self, model, messages, tools, tool_choice):
             self.calls += 1
             if self.calls == 1:
                 return chat_response(tool_calls=[tool_call("call_1", "get_order", {"order_id": order_id})])
@@ -93,11 +93,11 @@ if __name__ == "__main__":
     assert result["trace"][0]["result"]["order_id"] == order_id
 
     class UnknownToolClient:
-        def chat_completion(self, messages, tools, tool_choice):
+        def chat_completion(self, model, messages, tools, tool_choice):
             return chat_response(tool_calls=[tool_call("call_1", "delete_everything", {})])
 
     class LoopingClient:
-        def chat_completion(self, messages, tools, tool_choice):
+        def chat_completion(self, model, messages, tools, tool_choice):
             return chat_response(tool_calls=[tool_call("call_1", "search_knowledge_base", {"query": "x"})])
 
     unknown_result = run_agent("hi", max_steps=1, client=UnknownToolClient())

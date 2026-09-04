@@ -6,8 +6,11 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 
-from src.order_support_agent import TOOL_REGISTRY, TOOLS_SCHEMA, get_client
+from src.order_support_agent import MISTRAL_MODEL, TOOL_REGISTRY, TOOLS_SCHEMA, get_client
 from src.order_support_agent.agent import SYSTEM_PROMPT
+from src.tools.tools import get_order
+
+PERMISSION_GATED_TOOLS = {"cancel_order", "update_shipping_address"}
 
 
 class AgentState(TypedDict):
@@ -15,9 +18,17 @@ class AgentState(TypedDict):
     iteration_count: int
 
 
+def need_permission(tool_name: str, args: dict) -> bool:
+    """True if this tool call must be confirmed by a human before it runs."""
+    if tool_name not in PERMISSION_GATED_TOOLS:
+        return False
+    order = get_order(args.get("order_id", ""))
+    return bool(order) and order["status"] == "shipped"
+
+
 def call_model(state: AgentState, config: RunnableConfig) -> dict:
     client = config.get("configurable", {}).get("client") or get_client()
-    response = client.chat_completion(messages=state["messages"], tools=TOOLS_SCHEMA, tool_choice="auto")
+    response = client.chat_completion(model=MISTRAL_MODEL, messages=state["messages"], tools=TOOLS_SCHEMA, tool_choice="auto")
     message = response.choices[0].message
 
     new_message = {"role": "assistant", "content": message.content}
@@ -41,14 +52,18 @@ def call_tool(state: AgentState) -> dict:
         except json.JSONDecodeError:
             args = {}
 
-        fn = TOOL_REGISTRY.get(name)
-        if fn is None:
-            result = {"success": False, "error": f"unknown_tool:{name}"}
+        if need_permission(name, args):
+            result = {"success": False, "error": "requires_confirmation",
+                      "message": f"{name} on a shipped order requires human confirmation before it can run."}
         else:
-            try:
-                result = fn(**args)
-            except TypeError as e:
-                result = {"success": False, "error": f"bad_arguments:{e}"}
+            fn = TOOL_REGISTRY.get(name)
+            if fn is None:
+                result = {"success": False, "error": f"unknown_tool:{name}"}
+            else:
+                try:
+                    result = fn(**args)
+                except TypeError as e:
+                    result = {"success": False, "error": f"bad_arguments:{e}"}
 
         tool_messages.append({
             "role": "tool",
@@ -101,6 +116,8 @@ if __name__ == "__main__":
 
     conn = get_connection()
     order_id = conn.execute("SELECT order_id FROM orders LIMIT 1").fetchone()[0]
+    shipped_order = conn.execute("SELECT order_id, shipping_address FROM orders WHERE status = 'shipped' LIMIT 1").fetchone()
+    shipped_order_id, shipped_order_address = shipped_order
     conn.close()
 
     def tool_call(call_id, name, arguments):
@@ -113,7 +130,7 @@ if __name__ == "__main__":
         def __init__(self):
             self.calls = 0
 
-        def chat_completion(self, messages, tools, tool_choice):
+        def chat_completion(self, model, messages, tools, tool_choice):
             self.calls += 1
             if self.calls == 1:
                 return chat_response(tool_calls=[tool_call("call_1", "get_order", {"order_id": order_id})])
@@ -125,10 +142,33 @@ if __name__ == "__main__":
     assert tool_msgs and json.loads(tool_msgs[0]["content"])["order_id"] == order_id
 
     class LoopingClient:
-        def chat_completion(self, messages, tools, tool_choice):
+        def chat_completion(self, model, messages, tools, tool_choice):
             return chat_response(tool_calls=[tool_call("call_1", "search_knowledge_base", {"query": "x"})])
 
     capped_result = run_graph("hi", max_steps=2, client=LoopingClient())
     assert capped_result["error"] == "max_steps_exceeded"
+
+    assert need_permission("update_shipping_address", {"order_id": shipped_order_id}) is True
+    assert need_permission("get_order", {"order_id": shipped_order_id}) is False
+
+    class AddressChangeClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_completion(self, model, messages, tools, tool_choice):
+            self.calls += 1
+            if self.calls == 1:
+                return chat_response(tool_calls=[tool_call(
+                    "call_1", "update_shipping_address",
+                    {"order_id": shipped_order_id, "new_address": "999 Hijacked Ave, Nowhere, XX"},
+                )])
+            return chat_response(content="That order has already shipped, so I can't change the address without confirmation.")
+
+    gated_result = run_graph("please change my shipping address", client=AddressChangeClient())
+    tool_msgs = [m for m in gated_result["messages"] if m["role"] == "tool"]
+    assert json.loads(tool_msgs[0]["content"])["error"] == "requires_confirmation"
+
+    unchanged_order = get_order(shipped_order_id)
+    assert unchanged_order["shipping_address"] == shipped_order_address
 
     print("OK: langgraph self-checks passed")
