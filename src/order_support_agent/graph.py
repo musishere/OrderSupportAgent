@@ -1,6 +1,7 @@
 import json
 import logging
 import operator
+import time
 from typing import Annotated, TypedDict
 
 from langchain_core.runnables import RunnableConfig
@@ -12,6 +13,7 @@ from src.order_support_agent.agent import SYSTEM_PROMPT
 from src.tools.tools import get_order
 
 logger = logging.getLogger("agent.graph")
+trace_logger = logging.getLogger("agent.trace")
 
 PERMISSION_GATED_TOOLS = {"cancel_order", "update_shipping_address"}
 
@@ -19,6 +21,16 @@ PERMISSION_GATED_TOOLS = {"cancel_order", "update_shipping_address"}
 class AgentState(TypedDict):
     messages: Annotated[list, operator.add]
     iteration_count: int
+    trace: Annotated[list, operator.add]
+    last_call_signature: tuple | None
+    repeat_count: int
+    error: str | None
+
+
+def _emit(event: dict) -> dict:
+    """Record one structured trace event (step, latency, outcome) and log it as JSON."""
+    trace_logger.info(json.dumps(event, default=str))
+    return event
 
 
 def need_permission(tool_name: str, args: dict) -> bool:
@@ -31,7 +43,10 @@ def need_permission(tool_name: str, args: dict) -> bool:
 
 def call_model(state: AgentState, config: RunnableConfig) -> dict:
     client = config.get("configurable", {}).get("client") or get_client()
+    step = state["iteration_count"]
+    started = time.monotonic()
     response = client.chat_completion(model=MISTRAL_MODEL, messages=state["messages"], tools=TOOLS_SCHEMA, tool_choice="auto")
+    latency_ms = round((time.monotonic() - started) * 1000)
     message = response.choices[0].message
 
     new_message = {"role": "assistant", "content": message.content}
@@ -42,12 +57,41 @@ def call_model(state: AgentState, config: RunnableConfig) -> dict:
             for tc in message.tool_calls
         ]
 
-    return {"messages": [new_message], "iteration_count": state["iteration_count"] + 1}
+    trace_event = _emit({
+        "event": "llm_call",
+        "step": step,
+        "latency_ms": latency_ms,
+        "tool_calls_requested": [tc.function.name for tc in (message.tool_calls or [])],
+        "has_content": bool(message.content),
+    })
+
+    call_signature = tuple(sorted((tc.function.name, tc.function.arguments) for tc in message.tool_calls)) if message.tool_calls else None
+    repeat_count = state.get("repeat_count", 0) + 1 if call_signature is not None and call_signature == state.get("last_call_signature") else 1
+
+    if call_signature is not None and repeat_count >= 3:
+        content = "I have tried many times, I cannot continue any further."
+        _emit({"event": "loop_detected", "step": step, "tool_calls_requested": [tc.function.name for tc in message.tool_calls]})
+        return {
+            "messages": [{"role": "assistant", "content": content}],
+            "iteration_count": step + 1,
+            "trace": [trace_event],
+            "error": "loop_detected",
+        }
+
+    return {
+        "messages": [new_message],
+        "iteration_count": step + 1,
+        "trace": [trace_event],
+        "last_call_signature": call_signature,
+        "repeat_count": repeat_count,
+    }
 
 
 def call_tool(state: AgentState) -> dict:
     last = state["messages"][-1]
+    step = state["iteration_count"]
     tool_messages = []
+    trace_events = []
     for tc in last.get("tool_calls", []):
         name = tc["function"]["name"]
         try:
@@ -56,6 +100,7 @@ def call_tool(state: AgentState) -> dict:
             args = {}
 
         logger.info("tool_call name=%s args=%s", name, args)
+        started = time.monotonic()
 
         if need_permission(name, args):
             logger.warning("permission_denied tool=%s args=%s", name, args)
@@ -72,6 +117,19 @@ def call_tool(state: AgentState) -> dict:
                     result = {"success": False, "error": f"bad_arguments:{e}"}
             logger.info("tool_result name=%s result=%s", name, result)
 
+        latency_ms = round((time.monotonic() - started) * 1000)
+        success = result.get("success", True) if isinstance(result, dict) else True
+        error = result.get("error") if isinstance(result, dict) else None
+        trace_events.append(_emit({
+            "event": "tool_call",
+            "step": step,
+            "tool": name,
+            "args": args,
+            "success": success,
+            "error": error,
+            "latency_ms": latency_ms,
+        }))
+
         tool_messages.append({
             "role": "tool",
             "tool_call_id": tc["id"],
@@ -79,7 +137,7 @@ def call_tool(state: AgentState) -> dict:
             "content": json.dumps(result, default=str),
         })
 
-    return {"messages": tool_messages}
+    return {"messages": tool_messages, "trace": trace_events}
 
 
 def route_after_model(state: AgentState) -> str:
@@ -100,16 +158,23 @@ def run_graph(user_message: str, max_steps: int = 8, client=None, history: list 
     app = build_graph()
     messages = list(history) if history else [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.append({"role": "user", "content": user_message})
-    initial_state = {"messages": messages, "iteration_count": 0}
+    initial_state = {"messages": messages, "iteration_count": 0, "trace": [], "last_call_signature": None, "repeat_count": 0, "error": None}
     try:
         final_state = app.invoke(
             initial_state,
             config={"configurable": {"client": client}, "recursion_limit": max_steps * 2 + 2},
         )
     except GraphRecursionError:
-        return {"response": None, "messages": initial_state["messages"], "error": "max_steps_exceeded"}
+        # ponytail: langgraph doesn't hand back partial state on recursion error, so the
+        # trace up to the cutoff is lost here — switch to app.stream() if that's ever needed.
+        return {"response": None, "messages": initial_state["messages"], "error": "max_steps_exceeded", "trace": []}
 
-    return {"response": final_state["messages"][-1]["content"], "messages": final_state["messages"]}
+    return {
+        "response": final_state["messages"][-1]["content"],
+        "messages": final_state["messages"],
+        "trace": final_state["trace"],
+        "error": final_state.get("error"),
+    }
 
 
 if __name__ == "__main__":
@@ -144,11 +209,29 @@ if __name__ == "__main__":
     tool_msgs = [m for m in result["messages"] if m["role"] == "tool"]
     assert tool_msgs and json.loads(tool_msgs[0]["content"])["order_id"] == order_id
 
+    trace_events = {e["event"] for e in result["trace"]}
+    assert trace_events == {"llm_call", "tool_call"}
+    tool_trace = next(e for e in result["trace"] if e["event"] == "tool_call")
+    assert tool_trace["tool"] == "get_order" and tool_trace["success"] is True
+    assert all("latency_ms" in e for e in result["trace"])
+
     class LoopingClient:
         def chat_completion(self, model, messages, tools, tool_choice):
             return chat_response(tool_calls=[tool_call("call_1", "search_knowledge_base", {"query": "x"})])
 
-    capped_result = run_graph("hi", max_steps=2, client=LoopingClient())
+    loop_result = run_graph("hi", max_steps=10, client=LoopingClient())
+    assert loop_result["error"] == "loop_detected"
+    assert loop_result["response"] == "I have tried many times, I cannot continue any further."
+
+    class VaryingClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_completion(self, model, messages, tools, tool_choice):
+            self.calls += 1
+            return chat_response(tool_calls=[tool_call("call_1", "search_knowledge_base", {"query": f"x{self.calls}"})])
+
+    capped_result = run_graph("hi", max_steps=2, client=VaryingClient())
     assert capped_result["error"] == "max_steps_exceeded"
 
     assert need_permission("update_shipping_address", {"order_id": shipped_order_id}) is True

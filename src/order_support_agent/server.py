@@ -54,6 +54,7 @@ def chat(req: ChatRequest):
         "response": result.get("response"),
         "error": result.get("error"),
         "tool_calls": tool_calls,
+        "trace": result.get("trace", []),
         "elapsed_ms": elapsed_ms,
         "session_id": session_id,
     }
