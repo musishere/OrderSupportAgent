@@ -1,4 +1,5 @@
 import json
+import logging
 import operator
 from typing import Annotated, TypedDict
 
@@ -9,6 +10,8 @@ from langgraph.graph import END, START, StateGraph
 from src.order_support_agent import MISTRAL_MODEL, TOOL_REGISTRY, TOOLS_SCHEMA, get_client
 from src.order_support_agent.agent import SYSTEM_PROMPT
 from src.tools.tools import get_order
+
+logger = logging.getLogger("agent.graph")
 
 PERMISSION_GATED_TOOLS = {"cancel_order", "update_shipping_address"}
 
@@ -52,7 +55,10 @@ def call_tool(state: AgentState) -> dict:
         except json.JSONDecodeError:
             args = {}
 
+        logger.info("tool_call name=%s args=%s", name, args)
+
         if need_permission(name, args):
+            logger.warning("permission_denied tool=%s args=%s", name, args)
             result = {"success": False, "error": "requires_confirmation",
                       "message": f"{name} on a shipped order requires human confirmation before it can run."}
         else:
@@ -64,6 +70,7 @@ def call_tool(state: AgentState) -> dict:
                     result = fn(**args)
                 except TypeError as e:
                     result = {"success": False, "error": f"bad_arguments:{e}"}
+            logger.info("tool_result name=%s result=%s", name, result)
 
         tool_messages.append({
             "role": "tool",
@@ -89,15 +96,11 @@ def build_graph():
     return graph.compile()
 
 
-def run_graph(user_message: str, max_steps: int = 8, client=None) -> dict:
+def run_graph(user_message: str, max_steps: int = 8, client=None, history: list | None = None) -> dict:
     app = build_graph()
-    initial_state = {
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        "iteration_count": 0,
-    }
+    messages = list(history) if history else [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.append({"role": "user", "content": user_message})
+    initial_state = {"messages": messages, "iteration_count": 0}
     try:
         final_state = app.invoke(
             initial_state,

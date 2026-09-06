@@ -1,16 +1,16 @@
-import sys
-from pathlib import Path
+import os
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+import httpx
 import streamlit as st
 
-from src.order_support_agent.graph import run_graph
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 
 st.title("Order Support Agent")
 
 if "history" not in st.session_state:
     st.session_state.history = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = None
 
 for role, content in st.session_state.history:
     with st.chat_message(role):
@@ -24,19 +24,25 @@ if prompt := st.chat_input("Ask about an order (e.g. 'what's the status of ORD00
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
-                result = run_graph(prompt)
-            except Exception as e:
-                result = {"response": None, "error": str(e), "messages": []}
+                resp = httpx.post(
+                    f"{BACKEND_URL}/chat",
+                    json={"message": prompt, "session_id": st.session_state.session_id},
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                st.session_state.session_id = result.get("session_id")
+            except httpx.HTTPError as e:
+                result = {"response": None, "error": f"backend unreachable: {e}", "tool_calls": []}
 
         if result.get("error"):
             st.error(f"Agent error: {result['error']}")
             reply = f"Error: {result['error']}"
         else:
             st.markdown(result["response"])
-            tool_steps = [m for m in result["messages"] if m["role"] in ("assistant", "tool")]
-            if tool_steps:
+            if result.get("tool_calls"):
                 with st.expander("trace"):
-                    st.json(tool_steps)
+                    st.json(result["tool_calls"])
             reply = result["response"]
 
     st.session_state.history.append(("assistant", reply))
