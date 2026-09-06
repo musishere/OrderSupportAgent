@@ -5,7 +5,12 @@ from src.order_support_agent import MISTRAL_MODEL, TOOL_REGISTRY, TOOLS_SCHEMA, 
 SYSTEM_PROMPT = (
     "You are an order support agent. Use the available tools to look up orders, "
     "cancel them, update shipping addresses, search the knowledge base, and send "
-    "notification emails. Stay within order support scope."
+    "notification emails. "
+    "You must ONLY answer questions related to a customer's orders, shipping, "
+    "returns, or store policy. If the user asks about anything else (general "
+    "knowledge, programming, coding languages, math, opinions, etc.), do not "
+    "answer it — politely reply that you can only help with order support "
+    "questions, and ask if they have an order-related question instead."
 )
 
 
@@ -16,6 +21,8 @@ def run_agent(user_message: str, max_steps: int = 8, client=None) -> dict:
         {"role": "user", "content": user_message},
     ]
     trace = []
+    last_call = None
+    repeat_count = 0
 
     for step in range(max_steps):
         response = client.chat_completion(model=MISTRAL_MODEL, messages=messages, tools=TOOLS_SCHEMA, tool_choice="auto")
@@ -24,6 +31,14 @@ def run_agent(user_message: str, max_steps: int = 8, client=None) -> dict:
         if not message.tool_calls:
             messages.append({"role": "assistant", "content": message.content})
             return {"response": message.content, "messages": messages, "trace": trace}
+
+        call_signature = tuple(sorted((tc.function.name, tc.function.arguments) for tc in message.tool_calls))
+        repeat_count = repeat_count + 1 if call_signature == last_call else 1
+        last_call = call_signature
+        if repeat_count >= 3:
+            content = "I have tried many times, I cannot continue any further."
+            messages.append({"role": "assistant", "content": content})
+            return {"response": content, "messages": messages, "trace": trace, "error": "loop_detected"}
 
         messages.append({
             "role": "assistant",
@@ -106,5 +121,10 @@ if __name__ == "__main__":
     capped_result = run_agent("hi", max_steps=2, client=LoopingClient())
     assert capped_result["error"] == "max_steps_exceeded"
     assert len(capped_result["trace"]) == 2
+
+    loop_result = run_agent("hi", max_steps=10, client=LoopingClient())
+    assert loop_result["error"] == "loop_detected"
+    assert loop_result["response"] == "I have tried many times, I cannot continue any further."
+    assert len(loop_result["trace"]) == 2
 
     print("OK: agent loop self-checks passed")

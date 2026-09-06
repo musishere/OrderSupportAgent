@@ -30,8 +30,9 @@ def health():
 def chat(req: ChatRequest):
     session_id = req.session_id or uuid.uuid4().hex
     history = SESSIONS.get(session_id)
+    prior_len = len(history or [])
     logger.info("request session_id=%s new_session=%s history_len=%d message=%r",
-                session_id, history is None, len(history or []), req.message)
+                session_id, history is None, prior_len, req.message)
     started = time.monotonic()
 
     try:
@@ -44,7 +45,8 @@ def chat(req: ChatRequest):
 
     SESSIONS[session_id] = result["messages"]
     elapsed_ms = round((time.monotonic() - started) * 1000)
-    tool_calls = [m for m in result["messages"] if m["role"] == "tool"]
+    new_messages = result["messages"][prior_len:]
+    tool_calls = [m for m in new_messages if m["role"] == "tool"]
     logger.info("response session_id=%s elapsed_ms=%d tool_calls=%d history_len=%d error=%s",
                 session_id, elapsed_ms, len(tool_calls), len(result["messages"]), result.get("error"))
 
